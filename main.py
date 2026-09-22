@@ -1,4 +1,12 @@
 # -*- coding: utf8 -*-
+# =============================================================================
+# 改动说明（per-account pushplus）：
+#   1. run_single_account 增加 push_plus_token 参数，执行完每个账号后单独推到该账号自己的 pushplus。
+#   2. execute() 解析 CONFIG 里的 PUSH_PLUS_TOKENS（# 分隔，与 USER/PWD 对齐），逐账号传递。
+#   3. 全局汇总推送仍保留：若 CONFIG 里 PUSH_PLUS_TOKEN 也填了，会额外推一份总览；
+#      不想收总览就把全局 PUSH_PLUS_TOKEN 留空（此时汇总推送自动跳过 pushplus）。
+#   注意：原仓库 Sync fork 更新代码会覆盖本文件，需重新应用以上改动。
+# =============================================================================
 import math
 import traceback
 from datetime import datetime
@@ -14,12 +22,6 @@ import os
 from util.aes_help import encrypt_data, decrypt_data
 import util.zepp_helper as zeppHelper
 import util.push_util as push_util
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv(override=True)
-except ImportError:
-    pass
 
 # 获取默认值转int
 def get_int_value_default(_config: dict, _key, default):
@@ -190,21 +192,11 @@ class MiMotionRunner:
 
         step = str(random.randint(min_step, max_step))
         self.log_str += f"已设置为随机步数范围({min_step}~{max_step}) 随机值:{step}\n"
-        
-        user_token_info = user_tokens.get(self.user, {})
-        bound_device_id = user_token_info.get("bound_device_id")
-        if not bound_device_id and self.user_id:
-            bound_device_id = zeppHelper.get_user_device_id(app_token, self.user_id)
-            if bound_device_id:
-                user_token_info["bound_device_id"] = bound_device_id
-                user_tokens[self.user] = user_token_info
-                self.log_str += f"查找到已绑定设备ID: {bound_device_id}\n"
-
-        ok, msg = zeppHelper.post_fake_brand_data(step, app_token, self.user_id, device_id=bound_device_id)
+        ok, msg = zeppHelper.post_fake_brand_data(step, app_token, self.user_id)
         return f"修改步数（{step}）[" + msg + "]", ok
 
 
-def run_single_account(total, idx, user_mi, passwd_mi):
+def run_single_account(total, idx, user_mi, passwd_mi, push_plus_token=''):
     idx_info = ""
     if idx is not None:
         idx_info = f"[{idx + 1}/{total}]"
@@ -222,23 +214,35 @@ def run_single_account(total, idx, user_mi, passwd_mi):
         exec_result = {"user": user_mi, "success": False,
                        "msg": f"执行异常:{traceback.format_exc()}"}
     print(log_str)
+    # ===== per-account pushplus：每个账号单独推到自己的 token =====
+    if push_plus_token and push_plus_token != '' and push_plus_token != 'NO':
+        pc = push_util.PushConfig(
+            push_plus_token=push_plus_token,
+            push_plus_hour=config.get('PUSH_PLUS_HOUR'),
+            push_plus_max=get_int_value_default(config, 'PUSH_PLUS_MAX', 30),
+        )
+        push_util.push_results([exec_result], f"[{desensitize_user_name(user_mi)}] 单账号刷步结果", pc)
     return exec_result
 
 
 def execute():
     user_list = users.split('#')
     passwd_list = passwords.split('#')
+    # 解析每账号独立的 pushplus token，用 # 分隔，顺序与 USER/PWD 对齐
+    token_list = (config.get('PUSH_PLUS_TOKENS') or '').split('#')
+    token_list = (token_list + [''] * len(user_list))[:len(user_list)]  # 补齐长度，不足补空
     exec_results = []
     if len(user_list) == len(passwd_list):
         idx, total = 0, len(user_list)
         if use_concurrent:
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                exec_results = executor.map(lambda x: run_single_account(total, x[0], *x[1]),
-                                            enumerate(zip(user_list, passwd_list)))
+                exec_results = list(executor.map(
+                    lambda x: run_single_account(total, x[0], x[1][0], x[1][1], x[1][2]),
+                    enumerate(zip(user_list, passwd_list, token_list))))
         else:
-            for user_mi, passwd_mi in zip(user_list, passwd_list):
-                exec_results.append(run_single_account(total, idx, user_mi, passwd_mi))
+            for user_mi, passwd_mi, token_mi in zip(user_list, passwd_list, token_list):
+                exec_results.append(run_single_account(total, idx, user_mi, passwd_mi, token_mi))
                 idx += 1
                 if idx < total:
                     # 每个账号之间间隔一定时间请求一次，避免接口请求过于频繁导致异常
@@ -246,14 +250,14 @@ def execute():
         if encrypt_support:
             persist_user_tokens()
         success_count = 0
-        push_results = []
         for result in exec_results:
-            push_results.append(result)
             if result['success'] is True:
                 success_count += 1
         summary = f"\n执行账号总数{total}，成功：{success_count}，失败：{total - success_count}"
         print(summary)
-        push_util.push_results(push_results, summary, push_config)
+        # 全局汇总推送：若 CONFIG 的 PUSH_PLUS_TOKEN 留空则自动跳过 pushplus；
+        # 填了则额外推一份总览（每账号结果既独推又进总览，会重复，按需取舍）
+        push_util.push_results(exec_results, summary, push_config)
     else:
         print(f"账号数长度[{len(user_list)}]和密码数长度[{len(passwd_list)}]不匹配，跳过执行")
         exit(1)
@@ -300,58 +304,42 @@ if __name__ == "__main__":
             user_tokens = prepare_user_tokens()
         else:
             print("AES_KEY未设置或者无效 无法使用加密保存功能")
-    config = dict()
-    if "CONFIG" in os.environ:
+    if os.environ.__contains__("CONFIG") is False:
+        print("未配置CONFIG变量，无法执行")
+        exit(1)
+    else:
+        # region 初始化参数
+        config = dict()
         try:
             config = dict(json.loads(os.environ.get("CONFIG")))
         except:
             print("CONFIG格式不正确，请检查Secret配置，请严格按照JSON格式：使用双引号包裹字段和值，逗号不能多也不能少")
             traceback.print_exc()
             exit(1)
-    elif "USER" in os.environ and "PWD" in os.environ:
-        config = {
-            "USER": os.environ.get("USER"),
-            "PWD": os.environ.get("PWD"),
-            "MIN_STEP": os.environ.get("MIN_STEP", "18000"),
-            "MAX_STEP": os.environ.get("MAX_STEP", "25000"),
-            "PUSH_PLUS_TOKEN": os.environ.get("PUSH_PLUS_TOKEN", ""),
-            "PUSH_PLUS_HOUR": os.environ.get("PUSH_PLUS_HOUR", ""),
-            "PUSH_PLUS_MAX": os.environ.get("PUSH_PLUS_MAX", "30"),
-            "PUSH_WECHAT_WEBHOOK_KEY": os.environ.get("PUSH_WECHAT_WEBHOOK_KEY", ""),
-            "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-            "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", ""),
-            "SLEEP_GAP": os.environ.get("SLEEP_GAP", "5"),
-            "USE_CONCURRENT": os.environ.get("USE_CONCURRENT", "False")
-        }
-    else:
-        print("未配置CONFIG或USER/PWD环境变量，无法执行。请在本地创建.env文件或配置环境变量。")
-        exit(1)
-
-    # region 初始化参数
-    # 创建推送配置对象
-    push_config = push_util.PushConfig(
-        push_plus_token=config.get('PUSH_PLUS_TOKEN'),
-        push_plus_hour=config.get('PUSH_PLUS_HOUR'),
-        push_plus_max=get_int_value_default(config, 'PUSH_PLUS_MAX', 30),
-        push_wechat_webhook_key=config.get('PUSH_WECHAT_WEBHOOK_KEY'),
-        telegram_bot_token=config.get('TELEGRAM_BOT_TOKEN'),
-        telegram_chat_id=config.get('TELEGRAM_CHAT_ID')
-    )
-    sleep_seconds = config.get('SLEEP_GAP')
-    if sleep_seconds is None or sleep_seconds == '':
-        sleep_seconds = 5
-    sleep_seconds = float(sleep_seconds)
-    users = config.get('USER')
-    passwords = config.get('PWD')
-    if users is None or passwords is None:
-        print("未正确配置账号密码，无法执行")
-        exit(1)
-    min_step, max_step = get_min_max_by_time()
-    use_concurrent = config.get('USE_CONCURRENT')
-    if use_concurrent is not None and use_concurrent == 'True':
-        use_concurrent = True
-    else:
-        print(f"多账号执行间隔：{sleep_seconds}")
-        use_concurrent = False
-    # endregion
-    execute()
+        # 创建推送配置对象
+        push_config = push_util.PushConfig(
+            push_plus_token=config.get('PUSH_PLUS_TOKEN'),
+            push_plus_hour=config.get('PUSH_PLUS_HOUR'),
+            push_plus_max=get_int_value_default(config, 'PUSH_PLUS_MAX', 30),
+            push_wechat_webhook_key=config.get('PUSH_WECHAT_WEBHOOK_KEY'),
+            telegram_bot_token=config.get('TELEGRAM_BOT_TOKEN'),
+            telegram_chat_id=config.get('TELEGRAM_CHAT_ID')
+        )
+        sleep_seconds = config.get('SLEEP_GAP')
+        if sleep_seconds is None or sleep_seconds == '':
+            sleep_seconds = 5
+        sleep_seconds = float(sleep_seconds)
+        users = config.get('USER')
+        passwords = config.get('PWD')
+        if users is None or passwords is None:
+            print("未正确配置账号密码，无法执行")
+            exit(1)
+        min_step, max_step = get_min_max_by_time()
+        use_concurrent = config.get('USE_CONCURRENT')
+        if use_concurrent is not None and use_concurrent == 'True':
+            use_concurrent = True
+        else:
+            print(f"多账号执行间隔：{sleep_seconds}")
+            use_concurrent = False
+        # endregion
+        execute()
